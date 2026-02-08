@@ -6,7 +6,6 @@ import threading
 import urllib.parse
 import time
 import json
-import cgi
 import numpy as np
 import cv2
 from inky.auto import auto
