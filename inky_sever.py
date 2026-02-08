@@ -5,6 +5,10 @@ import glob
 import threading
 import urllib.parse
 import time
+import json
+import cgi
+import numpy as np
+import cv2
 from inky.auto import auto
 from PIL import Image
 
@@ -13,8 +17,63 @@ inky = auto()
 inky_lock = threading.Lock()
 
 IMG_DIR = "img"
+TARGET_SIZE = (640, 400)
 if not os.path.exists(IMG_DIR):
     os.makedirs(IMG_DIR)
+
+
+def process_upload_image(img_bytes, crop=None):
+    img_np = np.frombuffer(img_bytes, dtype=np.uint8)
+    img_bgr = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise ValueError("Unsupported image format")
+
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    # Same orientation fix used in main.py.
+    if img_rgb.shape[1] < img_rgb.shape[0]:
+        img_rgb = cv2.rotate(img_rgb, cv2.ROTATE_90_CLOCKWISE)
+
+    h, w = img_rgb.shape[:2]
+
+    if crop:
+        rotation = int(crop.get("rotation", 0)) % 360
+        if rotation == 90:
+            img_rgb = cv2.rotate(img_rgb, cv2.ROTATE_90_CLOCKWISE)
+        elif rotation == 180:
+            img_rgb = cv2.rotate(img_rgb, cv2.ROTATE_180)
+        elif rotation == 270:
+            img_rgb = cv2.rotate(img_rgb, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        h, w = img_rgb.shape[:2]
+        if isinstance(crop.get("points"), list) and len(crop["points"]) == 4:
+            x1, y1, x2, y2 = [int(v) for v in crop["points"]]
+            x = max(0, min(x1, w - 1))
+            y = max(0, min(y1, h - 1))
+            cw = max(1, min(x2 - x1, w - x))
+            ch = max(1, min(y2 - y1, h - y))
+        else:
+            x = max(0, min(int(crop.get("x", 0)), w - 1))
+            y = max(0, min(int(crop.get("y", 0)), h - 1))
+            cw = max(1, min(int(crop.get("width", w)), w - x))
+            ch = max(1, min(int(crop.get("height", h)), h - y))
+        img_rgb = img_rgb[y:y + ch, x:x + cw]
+    else:
+        aspect_target = TARGET_SIZE[0] / TARGET_SIZE[1]
+        aspect_img = w / h
+        if aspect_img > aspect_target:
+            new_w = int(h * aspect_target)
+            start_x = (w - new_w) // 2
+            img_rgb = img_rgb[:, start_x:start_x + new_w]
+        else:
+            new_h = int(w / aspect_target)
+            start_y = (h - new_h) // 2
+            img_rgb = img_rgb[start_y:start_y + new_h, :]
+
+    img_rgb = cv2.resize(img_rgb, TARGET_SIZE, interpolation=cv2.INTER_LANCZOS4)
+    out = io.BytesIO()
+    Image.fromarray(img_rgb).save(out, format="PNG")
+    return out.getvalue()
 
 def update_inky_task(img_bytes):
     with inky_lock:
@@ -49,6 +108,7 @@ def get_full_html():
     <head>
         <title>Inky Dash</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/croppie@2.6.5/croppie.css" />
         <style>
             :root {{ --accent: #00ff88; --bg: #121212; --card: #1e1e1e; }}
             body {{ font-family: system-ui, sans-serif; background: var(--bg); color: white; margin: 0; padding: 20px; }}
@@ -74,6 +134,13 @@ def get_full_html():
 
             input[type="file"] {{ margin: 1rem 0; color: #888; }}
             .btn {{ background: var(--accent); color: black; border: none; padding: 12px 24px; border-radius: 8px; font-weight: bold; cursor: pointer; width: 100%; max-width: 300px; }}
+            .btn-row {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }}
+            .btn-inline {{ max-width: none; flex: 1; }}
+            .btn-inline-wide {{ max-width: none; flex: 2; }}
+            .modal-overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,.8); z-index:200; }}
+            .modal-card {{ max-width:95vw; width:1000px; margin:4vh auto; background:#1e1e1e; border-radius:12px; padding:16px; }}
+            .muted {{ color:#999; }}
+            .crop-actions {{ margin-top: 8px; }}
         </style>
     </head>
     <body>
@@ -85,9 +152,10 @@ def get_full_html():
                     <span id="status-text">Checking status...</span>
                 </div>
                 <form method="POST" enctype="multipart/form-data">
-                    <input type="file" name="file" accept="image/png" required><br>
-                    <input type="submit" value="UPLOAD NEW IMAGE" class="btn">
+                    <input id="file-input" type="file" name="file" accept="image/*" required><br>
+                    <input type="submit" value="UPLOAD READY IMAGE" class="btn">
                 </form>
+                <button id="open-crop" class="btn" style="margin-top:10px;">CROP + PREPARE IMAGE</button>
             </div>
 
             <h3 style="color: #666; text-transform: uppercase; letter-spacing: 1px; font-size: 0.8rem;">Recent History</h3>
@@ -96,6 +164,23 @@ def get_full_html():
 
         <div id="toast">Updating Display...</div>
 
+        <div id="crop-modal" class="modal-overlay">
+            <div class="modal-card">
+                <h3>Crop tool (Croppie)</h3>
+                <p class="muted">Use mouse/touch to move and zoom. Crop + resize still happens on server with OpenCV.</p>
+                <div id="croppie-root"></div>
+                <div class="btn-row crop-actions">
+                    <button id="rotate-left" class="btn btn-inline">↺ Rotate Left</button>
+                    <button id="rotate-right" class="btn btn-inline">↻ Rotate Right</button>
+                </div>
+                <div class="btn-row">
+                    <button id="cancel-crop" class="btn btn-inline">Cancel</button>
+                    <button id="upload-crop" class="btn btn-inline-wide">Upload Cropped</button>
+                </div>
+            </div>
+        </div>
+
+        <script src="https://cdn.jsdelivr.net/npm/croppie@2.6.5/croppie.min.js"></script>
         <script>
             function showToast(msg) {{
                 const t = document.getElementById('toast');
@@ -132,6 +217,92 @@ def get_full_html():
             // Poll status every 5 seconds
             setInterval(updateStatus, 5000);
             updateStatus();
+
+            const fileInput = document.getElementById('file-input');
+            const openCrop = document.getElementById('open-crop');
+            const modal = document.getElementById('crop-modal');
+            const cancelCrop = document.getElementById('cancel-crop');
+            const uploadCrop = document.getElementById('upload-crop');
+            const rotateLeft = document.getElementById('rotate-left');
+            const rotateRight = document.getElementById('rotate-right');
+            const croppieRoot = document.getElementById('croppie-root');
+
+            let currentFile = null;
+            let cropper = null;
+            let cropRotation = 0;
+
+            function closeModal() {{
+                modal.style.display = 'none';
+                if (cropper) {{
+                    cropper.destroy();
+                    cropper = null;
+                }}
+            }}
+
+            function createCropper() {{
+                if (cropper) cropper.destroy();
+                cropper = new Croppie(croppieRoot, {{
+                    viewport: {{ width: 320, height: 200 }},
+                    boundary: {{ width: 900, height: 520 }},
+                    showZoomer: true,
+                    enableOrientation: true,
+                }});
+            }}
+
+            async function openCropperForFile(file) {{
+                currentFile = file;
+                cropRotation = 0;
+
+                const reader = new FileReader();
+                reader.onload = async (e) => {{
+                    modal.style.display = 'block';
+                    createCropper();
+                    await cropper.bind({{ url: e.target.result }});
+                }};
+                reader.readAsDataURL(file);
+            }}
+
+            openCrop.addEventListener('click', () => {{
+                const selected = fileInput.files[0];
+                if (!selected) {{
+                    showToast('Pick an image first');
+                    return;
+                }}
+                openCropperForFile(selected);
+            }});
+
+            rotateLeft.addEventListener('click', () => {{
+                if (!cropper) return;
+                cropRotation = (cropRotation - 90 + 360) % 360;
+                cropper.rotate(-90);
+            }});
+
+            rotateRight.addEventListener('click', () => {{
+                if (!cropper) return;
+                cropRotation = (cropRotation + 90) % 360;
+                cropper.rotate(90);
+            }});
+
+            cancelCrop.addEventListener('click', closeModal);
+
+            uploadCrop.addEventListener('click', async () => {{
+                if (!currentFile || !cropper) return;
+
+                const cropData = cropper.get();
+                const points = cropData.points || [];
+
+                const form = new FormData();
+                form.append('file', currentFile);
+                form.append('crop', JSON.stringify({{ points, rotation: cropRotation }}));
+
+                const res = await fetch('/prepare-upload', {{ method: 'POST', body: form }});
+                if (res.ok) {{
+                    closeModal();
+                    window.location.reload();
+                }} else {{
+                    showToast('Crop upload failed');
+                }}
+            }});
         </script>
     </body>
     </html>
@@ -165,6 +336,42 @@ class InkyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(get_full_html().encode())
 
     def do_POST(self):
+        if self.path == "/prepare-upload":
+            try:
+                form = cgi.FieldStorage(
+                    fp=self.rfile,
+                    headers=self.headers,
+                    environ={
+                        "REQUEST_METHOD": "POST",
+                        "CONTENT_TYPE": self.headers.get("Content-Type"),
+                    },
+                )
+                if "file" not in form:
+                    self.send_error(400, "Missing file")
+                    return
+
+                raw_bytes = form["file"].file.read()
+                crop_payload = form.getvalue("crop")
+                crop = None
+                if crop_payload:
+                    maybe_crop = json.loads(crop_payload)
+                    if isinstance(maybe_crop, dict):
+                        crop = maybe_crop
+
+                prepared_bytes = process_upload_image(raw_bytes, crop)
+
+                next_name = os.path.join(IMG_DIR, f"img_{int(time.time())}.png")
+                with open(next_name, "wb") as f:
+                    f.write(prepared_bytes)
+
+                threading.Thread(target=update_inky_task, args=(prepared_bytes,), daemon=True).start()
+
+                self.send_response(204)
+                self.end_headers()
+            except Exception as e:
+                self.send_error(400, f"Failed to prepare image: {e}")
+            return
+
         if self.path == "/reload":
             content_length = int(self.headers['Content-Length'])
             post_data = self.rfile.read(content_length).decode('utf-8')
