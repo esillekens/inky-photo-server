@@ -29,12 +29,6 @@ def process_upload_image(img_bytes, crop=None):
 
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-    # Same orientation fix used in main.py.
-    if img_rgb.shape[1] < img_rgb.shape[0]:
-        img_rgb = cv2.rotate(img_rgb, cv2.ROTATE_90_CLOCKWISE)
-
-    h, w = img_rgb.shape[:2]
-
     if crop:
         rotation = int(crop.get("rotation", 0)) % 360
         if rotation == 90:
@@ -58,6 +52,12 @@ def process_upload_image(img_bytes, crop=None):
             ch = max(1, min(int(crop.get("height", h)), h - y))
         img_rgb = img_rgb[y:y + ch, x:x + cw]
     else:
+        # Same orientation fix used in main.py.
+        if img_rgb.shape[1] < img_rgb.shape[0]:
+            img_rgb = cv2.rotate(img_rgb, cv2.ROTATE_90_CLOCKWISE)
+    
+        h, w = img_rgb.shape[:2]
+
         aspect_target = TARGET_SIZE[0] / TARGET_SIZE[1]
         aspect_img = w / h
         if aspect_img > aspect_target:
