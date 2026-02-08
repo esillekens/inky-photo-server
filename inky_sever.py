@@ -74,6 +74,49 @@ def process_upload_image(img_bytes, crop=None):
     Image.fromarray(img_rgb).save(out, format="PNG")
     return out.getvalue()
 
+def parse_multipart_form(headers, body):
+    content_type = headers.get("Content-Type", "")
+    if "multipart/form-data" not in content_type:
+        raise ValueError("Expected multipart/form-data")
+
+    boundary_key = "boundary="
+    if boundary_key not in content_type:
+        raise ValueError("Missing multipart boundary")
+    boundary = content_type.split(boundary_key, 1)[1].strip().strip('"').encode()
+
+    fields = {}
+    files = {}
+    for part in body.split(b"--" + boundary):
+        if not part or part in (b"--\r\n", b"--"):
+            continue
+        part = part.strip(b"\r\n")
+        if b"\r\n\r\n" not in part:
+            continue
+
+        header_blob, payload = part.split(b"\r\n\r\n", 1)
+        header_text = header_blob.decode("utf-8", errors="replace")
+        payload = payload.rstrip(b"\r\n")
+
+        name = None
+        filename = None
+        for header_line in header_text.split("\r\n"):
+            if header_line.lower().startswith("content-disposition:"):
+                for token in header_line.split(";"):
+                    token = token.strip()
+                    if token.startswith("name="):
+                        name = token.split("=", 1)[1].strip('"')
+                    elif token.startswith("filename="):
+                        filename = token.split("=", 1)[1].strip('"')
+        if not name:
+            continue
+
+        if filename:
+            files[name] = payload
+        else:
+            fields[name] = payload.decode("utf-8", errors="replace")
+
+    return fields, files
+
 def update_inky_task(img_bytes):
     with inky_lock:
         try:
@@ -337,21 +380,16 @@ class InkyHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/prepare-upload":
             try:
-                form = cgi.FieldStorage(
-                    fp=self.rfile,
-                    headers=self.headers,
-                    environ={
-                        "REQUEST_METHOD": "POST",
-                        "CONTENT_TYPE": self.headers.get("Content-Type"),
-                    },
-                )
-                if "file" not in form:
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(content_length)
+                fields, files = parse_multipart_form(self.headers, body)
+                raw_bytes = files.get("file")
+                if not raw_bytes:
                     self.send_error(400, "Missing file")
                     return
 
-                raw_bytes = form["file"].file.read()
-                crop_payload = form.getvalue("crop")
                 crop = None
+                crop_payload = fields.get("crop")
                 if crop_payload:
                     maybe_crop = json.loads(crop_payload)
                     if isinstance(maybe_crop, dict):
@@ -387,26 +425,27 @@ class InkyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         # New Uploads
-        content_length = int(self.headers['Content-Length'])
-        boundary = self.headers.get_boundary().encode()
-        raw_data = self.rfile.read(content_length)
-        parts = raw_data.split(boundary)
-        for part in parts:
-            if b'Content-Type: image/png' in part:
-                header_end = part.find(b'\r\n\r\n') + 4
-                footer_start = part.rfind(b'\r\n')
-                img_bytes = part[header_end:footer_start]
-                
-                next_name = os.path.join(IMG_DIR, f"img_{int(time.time())}.png")
-                with open(next_name, "wb") as f:
-                    f.write(img_bytes)
-                
-                threading.Thread(target=update_inky_task, args=(img_bytes,), daemon=True).start()
-                
-                self.send_response(303)
-                self.send_header("Location", "/")
-                self.end_headers()
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            _, files = parse_multipart_form(self.headers, body)
+            img_bytes = files.get("file")
+            if not img_bytes:
+                self.send_error(400, "Missing file")
                 return
+
+            next_name = os.path.join(IMG_DIR, f"img_{int(time.time())}.png")
+            with open(next_name, "wb") as f:
+                f.write(img_bytes)
+
+            threading.Thread(target=update_inky_task, args=(img_bytes,), daemon=True).start()
+
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+        except Exception as e:
+            self.send_error(400, f"Upload failed: {e}")
+        return
 
 if __name__ == "__main__":
     server = http.server.HTTPServer(('0.0.0.0', 8000), InkyHandler)
