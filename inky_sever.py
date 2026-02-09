@@ -8,8 +8,10 @@ import time
 import json
 import numpy as np
 import cv2
+from scipy.optimize import minimize
 from inky.auto import auto
 from PIL import Image
+from dither_engine import dither_to_indexed, apply_adjustments, get_palette_list
 
 # Initialize Inky
 inky = auto()
@@ -17,9 +19,55 @@ inky_lock = threading.Lock()
 
 IMG_DIR = "img"
 TARGET_SIZE = (640, 400)
+INKY_COLOURS = np.array([
+    [0., 0., 0.],
+    [100., 0., 0.],
+    [25., -100., 0.],
+    [25., 50., -86.],
+    [50., 81., 59.],
+    [100., 0., 100.],
+    [75., 50., 86.],
+], dtype="float32")
+HUE_BOUNDS = [(0.5, 3), (0, 2), (-20, 40), (60, 150), (0.4, 2.2), (0.8, 3), (-0.2, 0.2)]
+HUE_KEYS = ["sat", "vibrance", "blk", "wht", "gam", "contrast", "hue_rot"]
 if not os.path.exists(IMG_DIR):
     os.makedirs(IMG_DIR)
 
+
+def calculate_hue_loss(params, source, palette):
+    adjusted = apply_adjustments(source, *params)
+    pix = adjusted.reshape(-1, 3)
+    diff = pix[:, np.newaxis, :] - palette[np.newaxis, :, :]
+    nearest = palette[np.argmin(np.sum(diff**2, axis=2), axis=1)]
+    return np.mean(np.sum((nearest - source.reshape(-1, 3))**2, axis=1))
+
+
+def prepare_for_inky(image):
+    if image.mode == "P":
+        return image
+
+    img_rgb = np.array(image.convert("RGB"), dtype=np.uint8)
+    img_lab = cv2.cvtColor(img_rgb.astype(np.float32) / 255.0, cv2.COLOR_RGB2LAB)
+    res = minimize(
+        calculate_hue_loss,
+        [1.1, 0.5, 0.0, 100.0, 1.0, 1.0, 0.0],
+        args=(img_lab, INKY_COLOURS),
+        method="Nelder-Mead",
+        options={"maxiter": 400},
+        bounds=HUE_BOUNDS,
+    )
+    params = dict(zip(HUE_KEYS, res.x))
+    adjusted = apply_adjustments(img_lab, **params)
+    indexed = dither_to_indexed(adjusted, INKY_COLOURS, c=0.013 * 2)
+    out = Image.fromarray(indexed, mode="P")
+    out.putpalette(get_palette_list(INKY_COLOURS))
+    return out
+
+
+def to_png_bytes(image):
+    out = io.BytesIO()
+    image.save(out, format="PNG")
+    return out.getvalue()
 
 def process_upload_image(img_bytes, crop=None):
     img_np = np.frombuffer(img_bytes, dtype=np.uint8)
@@ -70,9 +118,7 @@ def process_upload_image(img_bytes, crop=None):
             img_rgb = img_rgb[start_y:start_y + new_h, :]
 
     img_rgb = cv2.resize(img_rgb, TARGET_SIZE, interpolation=cv2.INTER_LANCZOS4)
-    out = io.BytesIO()
-    Image.fromarray(img_rgb).save(out, format="PNG")
-    return out.getvalue()
+    return to_png_bytes(Image.fromarray(img_rgb))
 
 def parse_multipart_form(headers, body):
     content_type = headers.get("Content-Type", "")
@@ -121,6 +167,7 @@ def update_inky_task(img_bytes):
     with inky_lock:
         try:
             img = Image.open(io.BytesIO(img_bytes))
+            img = prepare_for_inky(img)
             inky.set_image(img)
             inky.show()
         except Exception as e:
@@ -395,7 +442,9 @@ class InkyHandler(http.server.BaseHTTPRequestHandler):
                     if isinstance(maybe_crop, dict):
                         crop = maybe_crop
 
-                prepared_bytes = process_upload_image(raw_bytes, crop)
+                upload_bytes = process_upload_image(raw_bytes, crop)
+                prepared = prepare_for_inky(Image.open(io.BytesIO(upload_bytes)))
+                prepared_bytes = to_png_bytes(prepared)
 
                 next_name = os.path.join(IMG_DIR, f"img_{int(time.time())}.png")
                 with open(next_name, "wb") as f:
@@ -434,11 +483,14 @@ class InkyHandler(http.server.BaseHTTPRequestHandler):
                 self.send_error(400, "Missing file")
                 return
 
+            prepared = prepare_for_inky(Image.open(io.BytesIO(img_bytes)))
+            prepared_bytes = to_png_bytes(prepared)
+
             next_name = os.path.join(IMG_DIR, f"img_{int(time.time())}.png")
             with open(next_name, "wb") as f:
-                f.write(img_bytes)
+                f.write(prepared_bytes)
 
-            threading.Thread(target=update_inky_task, args=(img_bytes,), daemon=True).start()
+            threading.Thread(target=update_inky_task, args=(prepared_bytes,), daemon=True).start()
 
             self.send_response(303)
             self.send_header("Location", "/")
